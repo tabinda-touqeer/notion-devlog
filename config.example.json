@@ -1,0 +1,13 @@
+{
+  "engineer_name": "Your Name",
+  "tasks_database_id": "00000000-0000-0000-0000-000000000001",
+  "eod_database_id": "00000000-0000-0000-0000-000000000002",
+  "shared_tasks_database_id": "",
+  "shared_eod_database_id": "",
+  "default_project": "My Project",
+  "default_branch": "main",
+  "default_remotes": ["origin"],
+  "default_sprint": "Sprint 1",
+  "eod_title_suffix": "Engineering Development",
+  "max_daily_hours": 12.0
+}

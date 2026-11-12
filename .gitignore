@@ -1,0 +1,14 @@
+# Local workspace secrets, IDs, and private engineering logs (never commit!)
+config.json
+daily_buffer.jsonl
+.env
+.env.*
+.notion_token
+.shared_notion_token
+
+# Python bytecode & local scratch artifacts
+__pycache__/
+*.py[cod]
+*.log
+task_spec*.json
+
