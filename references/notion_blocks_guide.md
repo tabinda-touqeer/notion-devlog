@@ -48,13 +48,38 @@ def code_block(code, language="python"):
         "type": "code",
         "code": {
             "language": language,
-            "rich_text": [{"text": {"content": code}}]
+            "rich_text": _chunk_rich_text(code),  # split <= 1900 chars per item
         }
+    }
+
+def todo_item(text, checked=False):
+    return {
+        "object": "block",
+        "type": "to_do",
+        "to_do": {"rich_text": _parse_inline_rich_text(text), "checked": bool(checked)},
+    }
+
+def table_block(rows, has_column_header=True):
+    width = len(rows[0])
+    return {
+        "object": "block",
+        "type": "table",
+        "table": {
+            "table_width": width,
+            "has_column_header": has_column_header,
+            "has_row_header": False,
+            "children": [
+                {"type": "table_row", "table_row": {"cells": [_parse_inline_rich_text(c) for c in r]}}
+                for r in rows
+            ],
+        },
     }
 
 def divider():
     return {"object": "block", "type": "divider", "divider": {}}
 ```
+
+> **Note:** Nested list items (`numbered_list_item` / `bulleted_list_item` with `children`) must stay at **<= 2 levels of nesting** per Notion API `create`/`append` call, and inline markdown (`**bold**`, `*italic*`, `` `code` ``) should be parsed into Notion `annotations` rather than left as raw asterisks/backticks.
 
 ---
 

@@ -2,7 +2,8 @@
 name: engineering-reporting
 description: >-
   Use this skill when logging software engineering tasks, reporting bug fixes,
-  documenting architectural decisions, or writing Daily Manager Briefings (End of Day reports)
+  documenting architectural decisions, creating deferred Parking Items (future implementation plans),
+  or writing Daily Manager Briefings (End of Day reports)
   in Notion or markdown. Enforces reader-friendly, professional language while strictly
   preserving product triggers, error payloads, root-cause analysis, code guardrails,
   architectural justifications, realistic effort tracking, test verification, and git traceability.
@@ -31,6 +32,7 @@ Its primary goal is twofold:
 > **NEVER update Notion before committing the code, and NEVER write `"Pending commit"`, `"uncommitted"`, or `"TBD"` in the Notion `Git Commits` column.**
 > 1. Always stage and commit completed, tested code to Git first on the active branch (`main`, `dev`, release branches, etc.).
 > 2. Record the actual commit hash (`git rev-parse --short HEAD`, e.g. `a1b2c3d`) in every task entry and Notion `Git Commits` property. `notion_logger.py` enforces this programmatically.
+> *(Exception: **Parking Items** represent deferred future implementation plans, so they do NOT require a Git commit hash yet — use `--park-item` / `--park-md` rather than `--log-task`.)*
 
 > [!IMPORTANT]
 > ### Ultra-Realistic Senior Engineer Time Estimation (`Time Spent (hrs)`)
@@ -155,6 +157,27 @@ When compiling an **End of Day (EOD) Manager Briefing**, use this structure:
 
 ---
 
+## Parking Items Workflow (Deferred Implementation Plans — Dual Personal & Shared)
+
+When work, a refactor, or a safeguard is intentionally **parked for future implementation**, publish it using the exact **2-level Notion hierarchy** and **Zero-Memory 5-Section Format** (see [references/parking_item_template.md](./references/parking_item_template.md)):
+
+### Mandatory Hierarchy & Personal-by-Default Isolation Rule
+- **Personal ONLY by Default (`--target personal`)**: Unless the user **explicitly asks** to publish to the Shared page as well, create and update Parking Items **ONLY in the Personal Notion hub (`parent_page_id`)**. Never push or mirror Parking Items to the Shared workspace without explicit user instruction.
+- **Separate `Parking items` Hubs When Explicit**: Maintain a separate **`Parking items`** index page (`🅿️`) directly under the Personal hub (`parent_page_id`, e.g. `Projects`), and ONLY create/write to a separate **`Parking items`** index page under the Shared hub (`shared_parent_page_id`, e.g. `ROHATECH AI Team`) when the user explicitly requests `--target shared` or `--target both`.
+- Never place standalone plan pages directly on the Personal or Shared hub page — keep **one single `Parking items` entry** on each hub.
+- Inside `Parking items`, keep only **one short intro callout** (`🅿️`) plus clickable child subpage titles. Clicking any title opens the full plan inside its own child subpage.
+
+### Mandatory Content Inside Each Parked Item Child Subpage
+Write so an engineer or agent opening the page months later with **zero prior memory** can implement it end-to-end without re-investigating:
+1. **Header Callout (`📌`, blue)**: Status (`Parked for future implementation`), date, Engineer/Project (automatically attached on Shared), target branch (`axon-core`, sync branches), and product Owner/Trigger (Zero Chat Leakage still applies).
+2. **`1. Problem & Exact Root Cause`**: Plain-English incident context, verbatim payload/error code block, and numbered root-cause layers citing exact file paths and line numbers.
+3. **`2. Complete Component / Flow Audit`**: Amber `⚠️` callout listing critical exceptions + a **Notion table** mapping all affected flows/components, keys, invariants, and intentionally valid empty values.
+4. **`3. Exact Step-by-Step Implementation Instructions`**: Numbered steps by file path with **copy-paste-ready code blocks** (split `<= 1900` chars per rich_text span, real Notion inline bold/code/italic formatting, nested sub-bullets `<= 2` levels).
+5. **`4. Verification Plan`**: Runnable test command + numbered `unittest` / integration assertions covering failure guards, positive flows, and edge-case regressions.
+6. **`5. Rollout Checklist`**: Notion `to_do` checkboxes covering implementation, verification, primary branch commit/push, and branch sync.
+
+---
+
 ## Notion Integration & Fast-Path Workflow
 
 The skill bundles an automated configuration and execution engine in `scripts/notion_logger.py` backed by a local `config.json` (copied from `config.example.json` or configured via environment variables) and a persistent local activity journal `daily_buffer.jsonl`.
@@ -164,8 +187,12 @@ Copy `config.example.json` to `config.json` (gitignored) or run `--setup-member`
 ```json
 {
   "engineer_name": "Your Name",
+  "parent_page_id": "<OPTIONAL_PERSONAL_HUB_PAGE_ID>",
+  "parking_page_id": "<AUTO_CREATED_PERSONAL_PARKING_ITEMS_PAGE_ID>",
   "tasks_database_id": "<YOUR_PERSONAL_TASKS_DATABASE_ID>",
   "eod_database_id": "<YOUR_PERSONAL_EOD_DATABASE_ID>",
+  "shared_parent_page_id": "<OPTIONAL_SHARED_TEAM_HUB_PAGE_ID>",
+  "shared_parking_page_id": "<AUTO_CREATED_SHARED_PARKING_ITEMS_PAGE_ID>",
   "shared_tasks_database_id": "<OPTIONAL_SHARED_TEAM_TASKS_DATABASE_ID>",
   "shared_eod_database_id": "<OPTIONAL_SHARED_TEAM_EOD_DATABASE_ID>",
   "default_project": "My Project",
@@ -176,7 +203,7 @@ Copy `config.example.json` to `config.json` (gitignored) or run `--setup-member`
   "max_daily_hours": 12.0
 }
 ```
-When shared database IDs are omitted/blank, `notion_logger.py` writes only to your personal databases. When configured, shared queries and upserts filter strictly by `Date` and `Engineer` so teammates never overwrite each other's rows or daily EOD briefings.
+When shared database/page IDs are omitted/blank, `notion_logger.py` writes only to your personal workspace. When configured, shared task/EOD queries and upserts filter strictly by `Date` and `Engineer`, whereas Parking Items default strictly to `--target personal` and write to Shared `Parking items` ONLY when explicitly requested via `--target shared` or `--target both`.
 
 ### 2. Built-in Zero Chat-Leakage Validator
 `notion_logger.py` enforces programmatic validation on all user input fields. If developer-to-AI chat phrasing (e.g., *"please check..."*, *"what did you do"*, *"commit and push"*) is accidentally supplied in `customer_queries`, the script raises an immediate validation error to prevent exposure.
@@ -211,6 +238,15 @@ python .agents/skills/engineering-reporting/scripts/notion_logger.py --sync-eod
 
 # 5. Backfill or repair buffered tasks & EODs in the Shared Team DB (idempotent):
 python .agents/skills/engineering-reporting/scripts/notion_logger.py --sync-shared --date all
+
+# 6. Create/verify Personal 'Parking items' page (default) and publish a deferred Zero-Memory Plan:
+python .agents/skills/engineering-reporting/scripts/notion_logger.py --init-parking
+python .agents/skills/engineering-reporting/scripts/notion_logger.py --park-item parking_spec.json
+python .agents/skills/engineering-reporting/scripts/notion_logger.py --park-md plan.md --title "My Deferred Feature"
+python .agents/skills/engineering-reporting/scripts/notion_logger.py --list-parking
+
+# Only add '--target shared' or '--target both' when the user explicitly requests Shared workspace parking:
+python .agents/skills/engineering-reporting/scripts/notion_logger.py --park-md plan.md --target shared
 ```
 
 ---
@@ -220,4 +256,5 @@ python .agents/skills/engineering-reporting/scripts/notion_logger.py --sync-shar
 - Automation CLI: [scripts/notion_logger.py](./scripts/notion_logger.py)
 - Task Template: [references/task_template.md](./references/task_template.md)
 - EOD Report Template: [references/eod_template.md](./references/eod_template.md)
+- Parking Item Template: [references/parking_item_template.md](./references/parking_item_template.md)
 - Notion Block Guide: [references/notion_blocks_guide.md](./references/notion_blocks_guide.md)

@@ -30,6 +30,7 @@ When you build software with an AI coding assistant, code moves fast — commits
 - **Realistic Time Tracking** — Estimates senior-engineer effort hours per task (`Time Spent (hrs)`) with a configurable daily limit (`max_daily_hours`) to keep daily timesheets realistic.
 - **One-Prompt Daily EOD Briefings** — Aggregates the day's tasks, total hours, key architectural decisions, and repository status into a ready-to-share manager summary.
 - **Solo & Free-Plan Team Support** — Every engineer keeps their own personal Notion page while updates can mirror automatically to a central **Shared Team Table** tagged by `Engineer` — giving managers one unified team view without needing paid workspace seats for everyone.
+- **Deferred Parking Items (Personal by Default, Optional Shared)** — Defer future tasks cleanly without polluting active dev logs or shared team boards: `notion_logger.py` creates a single **Parking items** index page in your Personal hub by default (and in a separate Shared **Parking items** page only when explicitly requested with `--target shared` or `--target both`), storing complete zero-memory implementation plans as clickable child subpages.
 
 ---
 
@@ -130,8 +131,12 @@ cp config.example.json config.json
 ```json
 {
   "engineer_name": "Your Name",
+  "parent_page_id": "<OPTIONAL_PERSONAL_HUB_PAGE_ID>",
+  "parking_page_id": "<AUTO_CREATED_PERSONAL_PARKING_ITEMS_PAGE_ID>",
   "tasks_database_id": "<PERSONAL_TASKS_DATABASE_ID>",
   "eod_database_id": "<PERSONAL_EOD_DATABASE_ID>",
+  "shared_parent_page_id": "<OPTIONAL_SHARED_HUB_PAGE_ID>",
+  "shared_parking_page_id": "<AUTO_CREATED_SHARED_PARKING_ITEMS_PAGE_ID>",
   "shared_tasks_database_id": "",
   "shared_eod_database_id": "",
   "default_project": "My Project",
@@ -146,8 +151,12 @@ cp config.example.json config.json
 | Field | Env Variable | Description |
 |---|---|---|
 | `engineer_name` | `ENGINEERING_ENGINEER_NAME` | Your display name tagged in the `Engineer` column on shared team tables. |
+| `parent_page_id` | `NOTION_PARENT_PAGE_ID` | *(Optional)* Personal Notion hub page ID (auto-filled during `--init-dbs` or resolved from `tasks_database_id`). |
+| `parking_page_id` | `NOTION_PARKING_PAGE_ID` | *(Optional)* Personal `Parking items` subpage ID (auto-created by `--init-parking`). |
 | `tasks_database_id` | `NOTION_TASKS_DB_ID` | Your personal Tasks database ID (auto-filled during setup). |
 | `eod_database_id` | `NOTION_EOD_DB_ID` | Your personal EOD Briefings database ID (auto-filled during setup). |
+| `shared_parent_page_id` | `NOTION_SHARED_PARENT_PAGE_ID` | *(Optional)* Shared team hub page ID (auto-resolved from `shared_tasks_database_id`). |
+| `shared_parking_page_id` | `NOTION_SHARED_PARKING_PAGE_ID` | *(Optional)* Shared `Parking items` subpage ID (auto-created by `--init-parking`). |
 | `shared_tasks_database_id` | `NOTION_SHARED_TASKS_DB_ID` | *(Optional)* Shared team Tasks database ID. |
 | `shared_eod_database_id` | `NOTION_SHARED_EOD_DB_ID` | *(Optional)* Shared team EOD Briefings database ID. |
 | `default_project` | — | Project name applied to logged tasks and EOD summaries. |
@@ -175,6 +184,12 @@ Commit my changes and log this task to Notion.
 
 ```text
 Create today's EOD report in Notion.
+```
+
+**Park a deferred feature or implementation plan:**
+
+```text
+Park this implementation plan in my Notion personal page.
 ```
 
 **Verify your setup:**

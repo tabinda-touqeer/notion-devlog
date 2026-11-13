@@ -19,6 +19,10 @@ Usage:
   python notion_logger.py --rebalance --date all
   python notion_logger.py --sync-shared [--date YYYY-MM-DD|all]
   python notion_logger.py --sync-eod [--date YYYY-MM-DD]
+  python notion_logger.py --init-parking [--target personal|shared|both]
+  python notion_logger.py --park-item parking_spec.json [--target personal|shared|both]
+  python notion_logger.py --park-md plan.md --title "My Plan" [--target personal|shared|both]
+  python notion_logger.py --list-parking [--target personal|shared|both]
 """
 
 import os
@@ -43,8 +47,12 @@ BUFFER_FILE = Path(os.environ.get("ENGINEERING_REPORTING_BUFFER") or (SKILL_DIR 
 def load_config() -> Dict[str, Any]:
     config: Dict[str, Any] = {
         "engineer_name": "",
+        "parent_page_id": "",
+        "parking_page_id": "",
         "tasks_database_id": "",
         "eod_database_id": "",
+        "shared_parent_page_id": "",
+        "shared_parking_page_id": "",
         "shared_tasks_database_id": "",
         "shared_eod_database_id": "",
         "default_project": "My Project",
@@ -64,8 +72,12 @@ def load_config() -> Dict[str, Any]:
 
     env_overrides = {
         "ENGINEERING_ENGINEER_NAME": "engineer_name",
+        "NOTION_PARENT_PAGE_ID": "parent_page_id",
+        "NOTION_PARKING_PAGE_ID": "parking_page_id",
         "NOTION_TASKS_DB_ID": "tasks_database_id",
         "NOTION_EOD_DB_ID": "eod_database_id",
+        "NOTION_SHARED_PARENT_PAGE_ID": "shared_parent_page_id",
+        "NOTION_SHARED_PARKING_PAGE_ID": "shared_parking_page_id",
         "NOTION_SHARED_TASKS_DB_ID": "shared_tasks_database_id",
         "NOTION_SHARED_EOD_DB_ID": "shared_eod_database_id",
     }
@@ -212,57 +224,216 @@ def validate_customer_input(query_text: str):
 # ---------------------------------------------------------
 # Notion Block Helpers
 # ---------------------------------------------------------
+_NOTION_TEXT_CHUNK_LIMIT = 1900
+_INLINE_MD_TOKEN_RE = re.compile(
+    r"(`[^`\n]+`|\*\*[^*\n]+\*\*|\*[^*\n]+\*|\[[^\]\n]+\]\([^\)\n]+\))"
+)
+
+
+def _chunk_rich_text(
+    text: str,
+    *,
+    bold: bool = False,
+    italic: bool = False,
+    code: bool = False,
+    link_url: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """Split text into Notion rich_text objects strictly <= 1900 characters each."""
+    value = str(text or "")
+    if not value:
+        return []
+    annotations: Dict[str, Any] = {}
+    if bold:
+        annotations["bold"] = True
+    if italic:
+        annotations["italic"] = True
+    if code:
+        annotations["code"] = True
+
+    chunks: List[Dict[str, Any]] = []
+    for i in range(0, len(value), _NOTION_TEXT_CHUNK_LIMIT):
+        text_obj: Dict[str, Any] = {"content": value[i : i + _NOTION_TEXT_CHUNK_LIMIT]}
+        if link_url:
+            text_obj["link"] = {"url": link_url}
+        item: Dict[str, Any] = {"type": "text", "text": text_obj}
+        if annotations:
+            item["annotations"] = dict(annotations)
+        chunks.append(item)
+    return chunks
+
+
+def _parse_inline_rich_text(text: str) -> List[Dict[str, Any]]:
+    """Convert inline markdown (**bold**, *italic*, `code`, [label](url)) into Notion rich_text spans."""
+    raw = str(text or "")
+    if not raw:
+        return [{"type": "text", "text": {"content": ""}}]
+
+    spans: List[Dict[str, Any]] = []
+    pos = 0
+    for match in _INLINE_MD_TOKEN_RE.finditer(raw):
+        if match.start() > pos:
+            spans.extend(_chunk_rich_text(raw[pos : match.start()]))
+        token = match.group(0)
+        if token.startswith("`") and token.endswith("`"):
+            spans.extend(_chunk_rich_text(token[1:-1], code=True))
+        elif token.startswith("**") and token.endswith("**"):
+            spans.extend(_chunk_rich_text(token[2:-2], bold=True))
+        elif token.startswith("*") and token.endswith("*"):
+            spans.extend(_chunk_rich_text(token[1:-1], italic=True))
+        elif token.startswith("[") and "](" in token and token.endswith(")"):
+            label, url = token[1:-1].split("](", 1)
+            if url.startswith(("http://", "https://")):
+                spans.extend(_chunk_rich_text(label, link_url=url))
+            else:
+                # file:// or relative local links render cleanly as code label in Notion
+                spans.extend(_chunk_rich_text(label, code=True))
+        pos = match.end()
+
+    if pos < len(raw):
+        spans.extend(_chunk_rich_text(raw[pos:]))
+    return spans or [{"type": "text", "text": {"content": ""}}]
+
+
 def heading_1(text: str) -> Dict[str, Any]:
-    return {"object": "block", "type": "heading_1", "heading_1": {"rich_text": [{"text": {"content": text[:2000]}}]}}
+    return {"object": "block", "type": "heading_1", "heading_1": {"rich_text": _parse_inline_rich_text(text)}}
+
 
 def heading_2(text: str) -> Dict[str, Any]:
-    return {"object": "block", "type": "heading_2", "heading_2": {"rich_text": [{"text": {"content": text[:2000]}}]}}
+    return {"object": "block", "type": "heading_2", "heading_2": {"rich_text": _parse_inline_rich_text(text)}}
+
 
 def heading_3(text: str) -> Dict[str, Any]:
-    return {"object": "block", "type": "heading_3", "heading_3": {"rich_text": [{"text": {"content": text[:2000]}}]}}
+    return {"object": "block", "type": "heading_3", "heading_3": {"rich_text": _parse_inline_rich_text(text)}}
+
 
 def paragraph(text: str, bold_prefix: str = "") -> Dict[str, Any]:
-    rt = []
+    rt: List[Dict[str, Any]] = []
     if bold_prefix:
-        rt.append({"text": {"content": bold_prefix[:500]}, "annotations": {"bold": True}})
-    rt.append({"text": {"content": text[:1500]}})
+        rt.extend(_chunk_rich_text(bold_prefix, bold=True))
+    rt.extend(_parse_inline_rich_text(text) if not bold_prefix else _chunk_rich_text(text))
     return {"object": "block", "type": "paragraph", "paragraph": {"rich_text": rt}}
 
-def bullet(text: str, bold_prefix: str = "") -> Dict[str, Any]:
-    rt = []
-    if bold_prefix:
-        rt.append({"text": {"content": bold_prefix[:500]}, "annotations": {"bold": True}})
-    rt.append({"text": {"content": text[:1500]}})
-    return {"object": "block", "type": "bulleted_list_item", "bulleted_list_item": {"rich_text": rt}}
 
-def callout(text: str, emoji: str = "📌") -> Dict[str, Any]:
+def rich_paragraph(rich_text: List[Dict[str, Any]]) -> Dict[str, Any]:
+    return {"object": "block", "type": "paragraph", "paragraph": {"rich_text": rich_text}}
+
+
+def bullet(
+    text: str,
+    bold_prefix: str = "",
+    children: Optional[List[Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
+    rt: List[Dict[str, Any]] = []
+    if bold_prefix:
+        rt.extend(_chunk_rich_text(bold_prefix, bold=True))
+    rt.extend(_parse_inline_rich_text(text) if not bold_prefix else _chunk_rich_text(text))
+    payload: Dict[str, Any] = {"rich_text": rt}
+    if children:
+        payload["children"] = children
+    return {"object": "block", "type": "bulleted_list_item", "bulleted_list_item": payload}
+
+
+def numbered_item(
+    text: str,
+    bold_prefix: str = "",
+    children: Optional[List[Dict[str, Any]]] = None,
+    rich_text: Optional[List[Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
+    if rich_text is not None:
+        rt = rich_text
+    else:
+        rt = []
+        if bold_prefix:
+            rt.extend(_chunk_rich_text(bold_prefix, bold=True))
+        rt.extend(_parse_inline_rich_text(text) if not bold_prefix else _chunk_rich_text(text))
+    payload: Dict[str, Any] = {"rich_text": rt}
+    if children:
+        payload["children"] = children
+    return {"object": "block", "type": "numbered_list_item", "numbered_list_item": payload}
+
+
+def todo_item(text: str, checked: bool = False) -> Dict[str, Any]:
     return {
         "object": "block",
-        "type": "callout",
-        "callout": {
-            "icon": {"type": "emoji", "emoji": emoji},
-            "rich_text": [{"text": {"content": text[:2000]}}]
-        }
+        "type": "to_do",
+        "to_do": {"rich_text": _parse_inline_rich_text(text), "checked": bool(checked)},
     }
+
+
+def callout(
+    text: str,
+    emoji: str = "📌",
+    color: Optional[str] = None,
+    rich_text: Optional[List[Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
+    payload: Dict[str, Any] = {
+        "icon": {"type": "emoji", "emoji": emoji},
+        "rich_text": rich_text if rich_text is not None else _parse_inline_rich_text(text),
+    }
+    if color:
+        payload["color"] = color
+    return {"object": "block", "type": "callout", "callout": payload}
+
 
 def code_block(code: str, language: str = "python") -> Dict[str, Any]:
     return {
         "object": "block",
         "type": "code",
         "code": {
-            "language": language,
-            "rich_text": [{"text": {"content": code[:2000]}}]
-        }
+            "language": language or "plain text",
+            "rich_text": _chunk_rich_text(code or "") or [{"type": "text", "text": {"content": ""}}],
+        },
     }
+
+
+def table_block(
+    rows: List[List[str]],
+    has_column_header: bool = True,
+) -> Dict[str, Any]:
+    width = len(rows[0]) if rows else 1
+    table_rows: List[Dict[str, Any]] = []
+    for row in rows:
+        padded = list(row[:width]) + [""] * max(0, width - len(row))
+        cells = [_parse_inline_rich_text(str(cell)) for cell in padded]
+        table_rows.append({"type": "table_row", "table_row": {"cells": cells}})
+    return {
+        "object": "block",
+        "type": "table",
+        "table": {
+            "table_width": width,
+            "has_column_header": has_column_header,
+            "has_row_header": False,
+            "children": table_rows,
+        },
+    }
+
 
 def divider() -> Dict[str, Any]:
     return {"object": "block", "type": "divider", "divider": {}}
 
-def clear_page_blocks(client: Client, page_id: str):
-    """Delete all children blocks of a page to allow clean overwriting."""
+
+def _list_all_children(client: Client, block_id: str) -> List[Dict[str, Any]]:
+    items: List[Dict[str, Any]] = []
+    cursor: Optional[str] = None
+    while True:
+        kwargs: Dict[str, Any] = {"block_id": block_id, "page_size": 100}
+        if cursor:
+            kwargs["start_cursor"] = cursor
+        res = client.blocks.children.list(**kwargs)
+        items.extend(res.get("results", []))
+        if not res.get("has_more"):
+            break
+        cursor = res.get("next_cursor")
+    return items
+
+
+def clear_page_blocks(client: Client, page_id: str, preserve_child_pages: bool = False):
+    """Delete children blocks of a page (optionally preserving nested child_page subpages)."""
     try:
-        blocks = client.blocks.children.list(block_id=page_id).get("results", [])
+        blocks = _list_all_children(client, page_id)
         for b in blocks:
+            if preserve_child_pages and b.get("type") == "child_page":
+                continue
             try:
                 client.blocks.delete(block_id=b["id"])
             except Exception:
@@ -613,7 +784,13 @@ def _build_date_engineer_filter(
     eng_type = _engineer_prop_type(props_schema)
     if eng_type == "rich_text":
         return {"and": [date_filter, {"property": "Engineer", "rich_text": {"equals": engineer_name}}]}
-    if eng_type == "select" or not props_schema:
+    if eng_type == "select":
+        options = (props_schema.get("Engineer") or {}).get("select", {}).get("options") or []
+        option_names = {str(o.get("name", "")).strip().lower() for o in options if o.get("name")}
+        if engineer_name.strip().lower() in option_names:
+            return {"and": [date_filter, {"property": "Engineer", "select": {"equals": engineer_name}}]}
+        return date_filter
+    if not props_schema:
         return {"and": [date_filter, {"property": "Engineer", "select": {"equals": engineer_name}}]}
     return date_filter
 
@@ -624,11 +801,22 @@ def _query_target_for_date(
     engineer_name: str = "",
 ) -> List[Dict[str, Any]]:
     notion_filter = _build_date_engineer_filter(target, target_date, engineer_name)
-    pages = query_database(
-        target["client"],
-        database_id=target["db_id"],
-        filter=notion_filter,
-    ).get("results", [])
+    try:
+        pages = query_database(
+            target["client"],
+            database_id=target["db_id"],
+            filter=notion_filter,
+        ).get("results", [])
+    except Exception as exc:
+        if "select option" in str(exc).lower() and target["is_shared"]:
+            date_only = {"property": "Date", "date": {"equals": target_date}}
+            pages = query_database(
+                target["client"],
+                database_id=target["db_id"],
+                filter=date_only,
+            ).get("results", [])
+        else:
+            raise
     if target["is_shared"] and engineer_name:
         filtered: List[Dict[str, Any]] = []
         for p in pages:
@@ -1610,9 +1798,11 @@ def init_notion_databases(parent_page: str, shared: bool = False) -> Dict[str, A
 
     cfg = load_config()
     if shared:
+        cfg["shared_parent_page_id"] = parent_page_id
         cfg["shared_tasks_database_id"] = tasks_res["id"]
         cfg["shared_eod_database_id"] = eod_res["id"]
     else:
+        cfg["parent_page_id"] = parent_page_id
         cfg["tasks_database_id"] = tasks_res["id"]
         cfg["eod_database_id"] = eod_res["id"]
 
@@ -1706,6 +1896,746 @@ def setup_member(
 
 
 # ---------------------------------------------------------
+# Parking Items (Deferred Plans — Dual Personal & Shared)
+# ---------------------------------------------------------
+_PARKING_INDEX_TITLE = "Parking items"
+_PARKING_INDEX_CALLOUT = (
+    "Parked engineering items — click any item below to open its full implementation plan."
+)
+
+
+def _save_config_updates(updates: Dict[str, Any]) -> None:
+    cfg = load_config()
+    cfg.update(updates)
+    CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
+    CONFIG_FILE.write_text(json.dumps(cfg, indent=2) + "\n", encoding="utf-8")
+    CONFIG.clear()
+    CONFIG.update(load_config())
+
+
+def _resolve_hub_page_id(client: Client, shared: bool = False) -> Optional[str]:
+    cfg_key = "shared_parent_page_id" if shared else "parent_page_id"
+    raw_parent = str(CONFIG.get(cfg_key) or "").strip()
+    if raw_parent:
+        return _extract_notion_id(raw_parent)
+
+    db_keys = (
+        ("shared_tasks_database_id", "shared_eod_database_id")
+        if shared
+        else ("tasks_database_id", "eod_database_id")
+    )
+    for db_key in db_keys:
+        db_id = str(CONFIG.get(db_key) or "").strip()
+        if not db_id:
+            continue
+        try:
+            meta = client.databases.retrieve(database_id=db_id)
+            parent = meta.get("parent") or {}
+            if parent.get("type") == "page_id" and parent.get("page_id"):
+                return parent["page_id"]
+        except Exception:
+            pass
+    return None
+
+
+def _find_child_page_by_title(
+    client: Client,
+    parent_page_id: str,
+    title: str,
+) -> Optional[Dict[str, str]]:
+    want = title.strip().lower()
+    want_stripped = _strip_leading_emoji(title).lower()
+    for blk in _list_all_children(client, parent_page_id):
+        if blk.get("type") != "child_page":
+            continue
+        found_title = (blk.get("child_page") or {}).get("title", "").strip()
+        if found_title.lower() == want or (
+            want_stripped and _strip_leading_emoji(found_title).lower() == want_stripped
+        ):
+            compact_id = blk["id"].replace("-", "")
+            return {
+                "id": blk["id"],
+                "title": found_title,
+                "url": f"https://www.notion.so/{compact_id}",
+            }
+    return None
+
+
+def _ensure_parking_index_page(
+    client: Client,
+    hub_page_id: str,
+    configured_parking_id: str = "",
+    clean_index: bool = False,
+) -> Dict[str, str]:
+    """Ensure ONE 'Parking items' child page exists under hub_page_id with a minimal index."""
+    parking_id = ""
+    parking_url = ""
+    action = "reused"
+
+    if configured_parking_id:
+        try:
+            meta = client.pages.retrieve(page_id=_extract_notion_id(configured_parking_id))
+            if not meta.get("archived") and not meta.get("in_trash"):
+                parking_id = meta["id"]
+                parking_url = meta.get("url", "")
+        except Exception:
+            parking_id = ""
+
+    if not parking_id:
+        existing = _find_child_page_by_title(client, hub_page_id, _PARKING_INDEX_TITLE)
+        if existing:
+            parking_id = existing["id"]
+            parking_url = existing["url"]
+            try:
+                page_meta = client.pages.retrieve(page_id=parking_id)
+                parking_url = page_meta.get("url") or parking_url
+            except Exception:
+                pass
+
+    if not parking_id:
+        created = client.pages.create(
+            parent={"page_id": hub_page_id},
+            icon={"type": "emoji", "emoji": "🅿️"},
+            properties={"title": {"title": [{"text": {"content": _PARKING_INDEX_TITLE}}]}},
+            children=[
+                callout(
+                    _PARKING_INDEX_CALLOUT,
+                    emoji="🅿️",
+                    color="gray_background",
+                )
+            ],
+        )
+        return {"id": created["id"], "url": created.get("url", ""), "action": "created"}
+
+    # Ensure existing Parking items index page stays clean & uncluttered
+    if clean_index:
+        clear_page_blocks(client, parking_id, preserve_child_pages=True)
+        existing_blocks: List[Dict[str, Any]] = []
+    else:
+        existing_blocks = _list_all_children(client, parking_id)
+
+    has_callout = any(b.get("type") == "callout" for b in existing_blocks)
+    if not has_callout:
+        append_blocks_safely(
+            client,
+            parking_id,
+            [callout(_PARKING_INDEX_CALLOUT, emoji="🅿️", color="gray_background")],
+        )
+    return {"id": parking_id, "url": parking_url, "action": action}
+
+
+def _resolve_parking_targets(
+    target: str = "personal",
+    personal_parent: Optional[str] = None,
+    shared_parent: Optional[str] = None,
+    clean_index: bool = False,
+    create_if_missing: bool = True,
+) -> List[Dict[str, Any]]:
+    mode = (target or "personal").strip().lower()
+    if mode not in ("personal", "shared", "both"):
+        raise ValueError(f"Invalid --target '{target}'. Use 'personal', 'shared', or 'both'.")
+
+    targets: List[Dict[str, Any]] = []
+    cfg_updates: Dict[str, Any] = {}
+
+    if mode in ("both", "personal"):
+        p_client = get_client()
+        hub_id = (
+            _extract_notion_id(personal_parent)
+            if personal_parent
+            else _resolve_hub_page_id(p_client, shared=False)
+        )
+        cfg_parking = str(CONFIG.get("parking_page_id") or "").strip()
+        if not hub_id and not cfg_parking:
+            raise ValueError(
+                "Could not determine Personal Notion hub page for Parking items. "
+                "Pass --parent-page or set 'parent_page_id' / 'parking_page_id' in config.json."
+            )
+        if not cfg_parking and hub_id:
+            cfg_updates["parent_page_id"] = hub_id
+        if create_if_missing:
+            info = (
+                _ensure_parking_index_page(
+                    p_client,
+                    hub_id or "",
+                    configured_parking_id=cfg_parking,
+                    clean_index=clean_index,
+                )
+                if hub_id
+                else {"id": _extract_notion_id(cfg_parking), "url": "", "action": "reused"}
+            )
+            cfg_updates["parking_page_id"] = info["id"]
+            targets.append({
+                "name": "personal",
+                "is_shared": False,
+                "client": p_client,
+                "hub_page_id": hub_id,
+                "parking_page_id": info["id"],
+                "parking_url": info["url"],
+                "index_action": info["action"],
+            })
+        else:
+            existing = (
+                {"id": _extract_notion_id(cfg_parking), "url": ""}
+                if cfg_parking
+                else (_find_child_page_by_title(p_client, hub_id, _PARKING_INDEX_TITLE) if hub_id else None)
+            )
+            if existing:
+                targets.append({
+                    "name": "personal",
+                    "is_shared": False,
+                    "client": p_client,
+                    "hub_page_id": hub_id,
+                    "parking_page_id": existing["id"],
+                    "parking_url": existing.get("url", ""),
+                    "index_action": "reused",
+                })
+
+    has_shared = bool(
+        shared_parent
+        or CONFIG.get("shared_parking_page_id")
+        or CONFIG.get("shared_parent_page_id")
+        or _has_shared_config()
+    )
+    if mode in ("shared", "both"):
+        if not has_shared:
+            raise ValueError(
+                "Shared target requested, but no Shared Notion hub/database is configured in config.json."
+            )
+        s_client = _resolve_shared_client()
+        s_hub_id = (
+            _extract_notion_id(shared_parent)
+            if shared_parent
+            else _resolve_hub_page_id(s_client, shared=True)
+        )
+        cfg_s_parking = str(CONFIG.get("shared_parking_page_id") or "").strip()
+        if not s_hub_id and not cfg_s_parking:
+            raise ValueError(
+                "Could not determine Shared Notion hub page for Parking items. "
+                "Pass --shared-parent-page or set 'shared_parent_page_id' / 'shared_parking_page_id' in config.json."
+            )
+        if s_hub_id:
+            cfg_updates["shared_parent_page_id"] = s_hub_id
+        if create_if_missing:
+            s_info = (
+                _ensure_parking_index_page(
+                    s_client,
+                    s_hub_id or "",
+                    configured_parking_id=cfg_s_parking,
+                    clean_index=clean_index,
+                )
+                if s_hub_id
+                else {"id": _extract_notion_id(cfg_s_parking), "url": "", "action": "reused"}
+            )
+            cfg_updates["shared_parking_page_id"] = s_info["id"]
+            targets.append({
+                "name": "shared",
+                "is_shared": True,
+                "client": s_client,
+                "hub_page_id": s_hub_id,
+                "parking_page_id": s_info["id"],
+                "parking_url": s_info["url"],
+                "index_action": s_info["action"],
+            })
+        else:
+            existing_s = (
+                {"id": _extract_notion_id(cfg_s_parking), "url": ""}
+                if cfg_s_parking
+                else (_find_child_page_by_title(s_client, s_hub_id, _PARKING_INDEX_TITLE) if s_hub_id else None)
+            )
+            if existing_s:
+                targets.append({
+                    "name": "shared",
+                    "is_shared": True,
+                    "client": s_client,
+                    "hub_page_id": s_hub_id,
+                    "parking_page_id": existing_s["id"],
+                    "parking_url": existing_s.get("url", ""),
+                    "index_action": "reused",
+                })
+
+    if cfg_updates:
+        _save_config_updates(cfg_updates)
+    return targets
+
+
+def _markdown_to_notion_blocks(md_text: str) -> Tuple[Optional[str], List[Dict[str, Any]]]:
+    """Parse structured engineering markdown (callouts, tables, code fences, nested lists, checklists) into Notion blocks."""
+    lines = md_text.replace("\r\n", "\n").split("\n")
+    extracted_title: Optional[str] = None
+    blocks: List[Dict[str, Any]] = []
+    i = 0
+    n = len(lines)
+
+    _LIST_ITEM_RE = re.compile(r"^(\s*)(\d+\.\s+|[-*]\s+)(.*)$")
+    _TODO_RE = re.compile(r"^-\s+\[([ xX])\]\s+(.*)$")
+    _CALLOUT_KIND_EMOJI = {
+        "NOTE": ("📌", "blue_background"),
+        "TIP": ("💡", "green_background"),
+        "IMPORTANT": ("❗", "purple_background"),
+        "WARNING": ("⚠️", "yellow_background"),
+        "CAUTION": ("🚨", "red_background"),
+    }
+
+    def _collect_nested_children(base_indent: int, start_idx: int, depth: int) -> Tuple[List[Dict[str, Any]], int]:
+        children: List[Dict[str, Any]] = []
+        idx = start_idx
+        while idx < n:
+            line = lines[idx]
+            stripped = line.strip()
+            if not stripped:
+                # Peek ahead: stop list nesting if next non-empty line is not indented deeper than base_indent
+                peek = idx + 1
+                while peek < n and not lines[peek].strip():
+                    peek += 1
+                if peek >= n:
+                    idx = peek
+                    break
+                next_indent = len(lines[peek]) - len(lines[peek].lstrip(" "))
+                if next_indent <= base_indent:
+                    idx += 1
+                    break
+                idx += 1
+                continue
+
+            indent = len(line) - len(line.lstrip(" "))
+            if indent <= base_indent:
+                break
+
+            # Fenced code block indented inside a list item
+            if stripped.startswith("```"):
+                lang = stripped[3:].strip() or "plain text"
+                code_lines: List[str] = []
+                idx += 1
+                while idx < n:
+                    cur = lines[idx]
+                    if cur.strip().startswith("```"):
+                        idx += 1
+                        break
+                    if len(cur) >= indent and not cur[:indent].strip():
+                        code_lines.append(cur[indent:])
+                    else:
+                        code_lines.append(cur.lstrip())
+                    idx += 1
+                children.append(code_block("\n".join(code_lines), language=lang))
+                continue
+
+            m = _LIST_ITEM_RE.match(line)
+            if m:
+                is_num = bool(re.match(r"^\d+\.\s+", m.group(2)))
+                item_text = m.group(3).strip()
+                item_indent = len(m.group(1))
+                sub_children: List[Dict[str, Any]] = []
+                idx += 1
+                if depth < 1:
+                    sub_children, idx = _collect_nested_children(item_indent, idx, depth + 1)
+                if is_num:
+                    children.append(numbered_item(item_text, children=sub_children or None))
+                else:
+                    children.append(bullet(item_text, children=sub_children or None))
+                continue
+
+            # Continuation text line inside list item
+            children.append(bullet(stripped))
+            idx += 1
+        return children, idx
+
+    while i < n:
+        line = lines[i]
+        stripped = line.strip()
+
+        if not stripped:
+            i += 1
+            continue
+
+        # Top-level H1 (used as page title if present at top)
+        if stripped.startswith("# ") and not blocks and extracted_title is None:
+            extracted_title = stripped[2:].strip()
+            i += 1
+            continue
+
+        if stripped == "---":
+            blocks.append(divider())
+            i += 1
+            continue
+
+        if stripped.startswith("### "):
+            blocks.append(heading_3(stripped[4:].strip()))
+            i += 1
+            continue
+        if stripped.startswith("## "):
+            blocks.append(heading_2(stripped[3:].strip()))
+            i += 1
+            continue
+        if stripped.startswith("# "):
+            blocks.append(heading_1(stripped[2:].strip()))
+            i += 1
+            continue
+
+        # Blockquote / GitHub alert callout
+        if stripped.startswith(">"):
+            quote_lines: List[str] = []
+            while i < n and lines[i].strip().startswith(">"):
+                content = lines[i].strip()[1:].lstrip()
+                quote_lines.append(content)
+                i += 1
+            emoji, color = "📌", "blue_background"
+            if quote_lines:
+                alert_match = re.match(r"^\[!(NOTE|TIP|IMPORTANT|WARNING|CAUTION)\]$", quote_lines[0].strip(), re.IGNORECASE)
+                if alert_match:
+                    emoji, color = _CALLOUT_KIND_EMOJI[alert_match.group(1).upper()]
+                    quote_lines = quote_lines[1:]
+            blocks.append(callout("\n".join(quote_lines).strip(), emoji=emoji, color=color))
+            continue
+
+        # Fenced code block
+        if stripped.startswith("```"):
+            lang = stripped[3:].strip() or "plain text"
+            code_lines = []
+            i += 1
+            while i < n and not lines[i].strip().startswith("```"):
+                code_lines.append(lines[i])
+                i += 1
+            if i < n and lines[i].strip().startswith("```"):
+                i += 1
+            blocks.append(code_block("\n".join(code_lines), language=lang))
+            continue
+
+        # GFM Markdown table
+        if stripped.startswith("|") and i + 1 < n and re.match(r"^\|[\s:\-\|]+\|$", lines[i + 1].strip()):
+            table_rows: List[List[str]] = []
+            header_cells = [c.strip() for c in stripped.strip("|").split("|")]
+            table_rows.append([f"**{c}**" if not c.startswith("**") else c for c in header_cells])
+            i += 2  # Skip separator line
+            while i < n and lines[i].strip().startswith("|"):
+                row_cells = [c.strip() for c in lines[i].strip().strip("|").split("|")]
+                table_rows.append(row_cells)
+                i += 1
+            blocks.append(table_block(table_rows, has_column_header=True))
+            continue
+
+        # To-do checklist
+        todo_m = _TODO_RE.match(stripped)
+        if todo_m:
+            blocks.append(todo_item(todo_m.group(2).strip(), checked=(todo_m.group(1).lower() == "x")))
+            i += 1
+            continue
+
+        # Top-level numbered or bulleted list item (with up to 2 nested levels)
+        list_m = _LIST_ITEM_RE.match(line)
+        if list_m:
+            is_num = bool(re.match(r"^\d+\.\s+", list_m.group(2)))
+            base_indent = len(list_m.group(1))
+            item_text = list_m.group(3).strip()
+            i += 1
+            children, i = _collect_nested_children(base_indent, i, depth=0)
+            if is_num:
+                blocks.append(numbered_item(item_text, children=children or None))
+            else:
+                blocks.append(bullet(item_text, children=children or None))
+            continue
+
+        # Paragraph (group consecutive plain text lines)
+        para_lines = [stripped]
+        i += 1
+        while i < n:
+            nxt = lines[i].strip()
+            if (
+                not nxt
+                or nxt == "---"
+                or nxt.startswith(("#", ">", "```", "|"))
+                or _TODO_RE.match(nxt)
+                or _LIST_ITEM_RE.match(lines[i])
+            ):
+                break
+            para_lines.append(nxt)
+            i += 1
+        blocks.append({"object": "block", "type": "paragraph", "paragraph": {"rich_text": _parse_inline_rich_text(" ".join(para_lines))}})
+
+    return extracted_title, blocks
+
+
+def _build_parking_step_item_block(item: Any) -> Dict[str, Any]:
+    if isinstance(item, str):
+        return numbered_item(item)
+    text = str(item.get("text") or "")
+    children: List[Dict[str, Any]] = []
+    if item.get("code"):
+        children.append(code_block(item["code"], language=item.get("language", "python")))
+    for sub in item.get("bullets", []):
+        if isinstance(sub, dict):
+            sub_children: List[Dict[str, Any]] = []
+            if sub.get("code"):
+                sub_children.append(code_block(sub["code"], language=sub.get("language", "python")))
+            for nested_b in sub.get("bullets", []):
+                sub_children.append(bullet(str(nested_b)))
+            for idx_num, nested_n in enumerate(sub.get("numbered", []), 1):
+                sub_children.append(numbered_item(str(nested_n)))
+            children.append(bullet(str(sub.get("text") or ""), children=sub_children or None))
+        else:
+            children.append(bullet(str(sub)))
+    return numbered_item(text, children=children or None)
+
+
+def _build_parking_item_blocks(
+    spec: Dict[str, Any],
+    *,
+    is_shared: bool = False,
+    engineer_name: str = "",
+) -> Tuple[str, str, List[Dict[str, Any]]]:
+    """Build exact 5-section Zero-Memory Implementation Plan blocks for a Parking Item page."""
+    title = str(spec.get("title") or "").strip() or "Untitled Parked Item"
+    icon_emoji = str(spec.get("icon") or "🛡️").strip() or "🛡️"
+
+    if spec.get("markdown_path") or spec.get("markdown"):
+        md_raw = (
+            Path(spec["markdown_path"]).read_text(encoding="utf-8")
+            if spec.get("markdown_path")
+            else str(spec["markdown"])
+        )
+        parsed_title, md_blocks = _markdown_to_notion_blocks(md_raw)
+        final_title = title if spec.get("title") else (parsed_title or title)
+        if is_shared and engineer_name and md_blocks and md_blocks[0].get("type") == "callout":
+            # Add Engineer attribution line to shared header callout cleanly
+            rt_list = list(md_blocks[0]["callout"]["rich_text"])
+            rt_list.append({"type": "text", "text": {"content": "\n"}})
+            rt_list.extend(_chunk_rich_text("Engineer / Project: ", bold=True))
+            proj = str(spec.get("project") or CONFIG.get("default_project") or "").strip()
+            attr = f"{engineer_name} ({proj})" if proj else engineer_name
+            rt_list.extend(_chunk_rich_text(attr))
+            md_blocks[0]["callout"]["rich_text"] = rt_list
+        return final_title, icon_emoji, md_blocks
+
+    status = str(spec.get("status") or "Parked for future implementation")
+    date_str = str(spec.get("date") or datetime.now().strftime("%Y-%m-%d"))
+    target_branch = str(spec.get("target_branch") or CONFIG.get("default_branch") or "main")
+    project = str(spec.get("project") or CONFIG.get("default_project") or "")
+    owner_trigger = str(spec.get("owner_trigger") or "")
+    if owner_trigger:
+        validate_customer_input(owner_trigger)
+
+    meta_parts: List[str] = [f"**Status:** {status} ({date_str})"]
+    if is_shared and (engineer_name or project):
+        meta_parts.append(f"**Engineer / Project:** {engineer_name or 'Team'} ({project})")
+    elif project:
+        meta_parts.append(f"**Project:** {project}")
+    meta_parts.append(f"**Target Branch:** `{target_branch}`")
+    if owner_trigger:
+        meta_parts.append(f"**Owner / Trigger:** {owner_trigger}")
+
+    blocks: List[Dict[str, Any]] = [
+        callout("\n".join(meta_parts), emoji="📌", color="blue_background"),
+        divider(),
+    ]
+
+    # 1. Problem & Exact Root Cause
+    problem = spec.get("problem") or {}
+    if problem:
+        blocks.append(heading_2("1. Problem & Exact Root Cause"))
+        if problem.get("summary"):
+            validate_customer_input(str(problem["summary"]))
+            blocks.append({"object": "block", "type": "paragraph", "paragraph": {"rich_text": _parse_inline_rich_text(str(problem["summary"]))}})
+        sample = problem.get("sample_payload")
+        if isinstance(sample, dict) and sample.get("code"):
+            blocks.append(code_block(sample["code"], language=sample.get("language", "json")))
+        root_causes = problem.get("root_causes") or []
+        if root_causes:
+            blocks.append(heading_3(str(problem.get("why_not_caught_title") or "Why existing safeguards missed this")))
+            for rc in root_causes:
+                if isinstance(rc, dict):
+                    rc_text = f"**{rc.get('title', 'Root Cause')}:** {rc.get('detail', '')}"
+                else:
+                    rc_text = str(rc)
+                blocks.append(numbered_item(rc_text))
+        blocks.append(divider())
+
+    # 2. Complete Component / Flow Audit
+    audit = spec.get("audit") or {}
+    if audit:
+        blocks.append(heading_2(str(audit.get("title") or "2. Complete Flow Audit (Critical Constraints Before Editing)")))
+        if audit.get("warning"):
+            blocks.append(callout(str(audit["warning"]), emoji="⚠️", color="yellow_background"))
+        cols = audit.get("columns") or []
+        rows = audit.get("rows") or []
+        if cols and rows:
+            header_row = [f"**{c}**" if not str(c).startswith("**") else str(c) for c in cols]
+            blocks.append(table_block([header_row] + rows, has_column_header=True))
+        blocks.append(divider())
+
+    # 3. Exact Step-by-Step Implementation Instructions
+    impl_steps = spec.get("implementation_steps") or []
+    if impl_steps:
+        blocks.append(heading_2("3. Exact Step-by-Step Implementation Instructions"))
+        for step in impl_steps:
+            blocks.append(heading_3(str(step.get("title") or "Implementation Step")))
+            if step.get("file"):
+                blocks.append({"object": "block", "type": "paragraph", "paragraph": {"rich_text": _parse_inline_rich_text(f"**File:** `{step['file']}`")}})
+            if step.get("description"):
+                blocks.append({"object": "block", "type": "paragraph", "paragraph": {"rich_text": _parse_inline_rich_text(str(step["description"]))}})
+            for item in step.get("items", []):
+                blocks.append(_build_parking_step_item_block(item))
+        blocks.append(divider())
+
+    # 4. Verification Plan
+    verif = spec.get("verification_plan") or {}
+    if verif:
+        blocks.append(heading_2(str(verif.get("title") or "4. Verification Plan")))
+        if verif.get("command"):
+            blocks.append({"object": "block", "type": "paragraph", "paragraph": {"rich_text": _parse_inline_rich_text(f"Run tests using `{verif['command']}`:")}})
+        for case in verif.get("cases", []):
+            if isinstance(case, dict):
+                children = [bullet(str(d)) for d in case.get("details", [])]
+                blocks.append(numbered_item(f"**{case.get('title', 'Test Case')}**", children=children or None))
+            else:
+                blocks.append(numbered_item(str(case)))
+        blocks.append(divider())
+
+    # 5. Rollout Checklist
+    checklist = spec.get("rollout_checklist") or []
+    if checklist:
+        blocks.append(heading_2("5. Rollout Checklist"))
+        for item in checklist:
+            if isinstance(item, dict):
+                blocks.append(todo_item(str(item.get("text") or ""), checked=bool(item.get("checked", False))))
+            else:
+                blocks.append(todo_item(str(item), checked=False))
+
+    return title, icon_emoji, blocks
+
+
+def _upsert_parking_child_page(
+    target_info: Dict[str, Any],
+    title: str,
+    icon_emoji: str,
+    blocks: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    client: Client = target_info["client"]
+    parking_page_id: str = target_info["parking_page_id"]
+    existing = _find_child_page_by_title(client, parking_page_id, title)
+
+    if existing:
+        page_id = existing["id"]
+        client.pages.update(
+            page_id=page_id,
+            icon={"type": "emoji", "emoji": icon_emoji},
+            properties={"title": {"title": [{"text": {"content": title[:2000]}}]}},
+        )
+        clear_page_blocks(client, page_id, preserve_child_pages=True)
+        append_blocks_safely(client, page_id, blocks)
+        meta = client.pages.retrieve(page_id=page_id)
+        return {
+            "id": page_id,
+            "url": meta.get("url") or existing["url"],
+            "action": "updated",
+            "blocks_written": len(blocks),
+        }
+
+    created = client.pages.create(
+        parent={"page_id": parking_page_id},
+        icon={"type": "emoji", "emoji": icon_emoji},
+        properties={"title": {"title": [{"text": {"content": title[:2000]}}]}},
+        children=blocks[:100],
+    )
+    page_id = created["id"]
+    if len(blocks) > 100:
+        append_blocks_safely(client, page_id, blocks[100:])
+    return {
+        "id": page_id,
+        "url": created.get("url", ""),
+        "action": "created",
+        "blocks_written": len(blocks),
+    }
+
+
+def init_parking_pages(
+    target: str = "personal",
+    personal_parent: Optional[str] = None,
+    shared_parent: Optional[str] = None,
+    clean_index: bool = False,
+) -> Dict[str, Any]:
+    """Ensure separate 'Parking items' index pages exist on the selected Notion hub(s)."""
+    resolved = _resolve_parking_targets(
+        target=target,
+        personal_parent=personal_parent,
+        shared_parent=shared_parent,
+        clean_index=clean_index,
+        create_if_missing=True,
+    )
+    summary: Dict[str, Any] = {}
+    for t in resolved:
+        summary[t["name"]] = {
+            "hub_page_id": t["hub_page_id"],
+            "parking_page_id": t["parking_page_id"],
+            "parking_url": t["parking_url"],
+            "action": t["index_action"],
+        }
+        print(
+            f"[{t['name'].capitalize()}] Parking items index ({t['index_action']}): "
+            f"{t['parking_page_id']} {t['parking_url']}"
+        )
+    return summary
+
+
+def park_item(
+    spec: Dict[str, Any],
+    target: str = "personal",
+    personal_parent: Optional[str] = None,
+    shared_parent: Optional[str] = None,
+    clean_index: bool = False,
+) -> Dict[str, Any]:
+    """Publish a deferred Zero-Memory Implementation Plan to Personal (default) and/or Shared Parking items."""
+    targets = _resolve_parking_targets(
+        target=target,
+        personal_parent=personal_parent,
+        shared_parent=shared_parent,
+        clean_index=clean_index,
+        create_if_missing=True,
+    )
+    engineer_name = str(spec.get("engineer_name") or CONFIG.get("engineer_name") or "").strip()
+    results: Dict[str, Any] = {}
+
+    for t in targets:
+        final_title, icon_emoji, blocks = _build_parking_item_blocks(
+            spec,
+            is_shared=t["is_shared"],
+            engineer_name=engineer_name,
+        )
+        res = _upsert_parking_child_page(t, final_title, icon_emoji, blocks)
+        res["parking_page_id"] = t["parking_page_id"]
+        res["parking_url"] = t["parking_url"]
+        results[t["name"]] = res
+        print(
+            f"[{t['name'].capitalize()}] Parked item ({res['action']}, {res['blocks_written']} blocks): "
+            f"{final_title}\n  URL: {res['url']}"
+        )
+
+    return results
+
+
+def list_parking_items(target: str = "personal") -> Dict[str, List[Dict[str, str]]]:
+    """List parked child page items in the selected Parking items page(s) without creating missing pages."""
+    targets = _resolve_parking_targets(target=target, clean_index=False, create_if_missing=False)
+    out: Dict[str, List[Dict[str, str]]] = {}
+    for t in targets:
+        items: List[Dict[str, str]] = []
+        for blk in _list_all_children(t["client"], t["parking_page_id"]):
+            if blk.get("type") == "child_page":
+                title = (blk.get("child_page") or {}).get("title", "").strip()
+                items.append({
+                    "id": blk["id"],
+                    "title": title,
+                    "url": f"https://www.notion.so/{blk['id'].replace('-', '')}",
+                })
+        out[t["name"]] = items
+        print(f"\n[{t['name'].capitalize()}] Parking items ({t['parking_page_id']}):")
+        if not items:
+            print("  (empty)")
+        for idx, item in enumerate(items, 1):
+            print(f"  {idx}. {item['title']} ({item['id']})")
+    return out
+
+
+# ---------------------------------------------------------
 # CLI Entrypoint
 # ---------------------------------------------------------
 def _check_db_access(client: Client, label: str, db_id: str) -> bool:
@@ -1777,6 +2707,14 @@ if __name__ == "__main__":
     parser.add_argument("--log-task", type=str, help="Path to JSON task spec file to publish to Notion")
     parser.add_argument("--sync-eod", action="store_true", help="Auto-compile today's tasks into the EOD Briefing")
     parser.add_argument("--sync-shared", action="store_true", help="Backfill buffered tasks & EODs into Shared Team Notion DBs")
+    parser.add_argument("--init-parking", action="store_true", help="Create/verify separate 'Parking items' pages on Personal and Shared Notion hubs")
+    parser.add_argument("--park-item", type=str, help="Path to JSON parking spec file to publish to Personal & Shared Parking items")
+    parser.add_argument("--park-md", type=str, help="Path to a Markdown implementation plan to publish to Personal & Shared Parking items")
+    parser.add_argument("--list-parking", action="store_true", help="List parked items under Personal & Shared Parking items pages")
+    parser.add_argument("--target", type=str, default="personal", choices=["personal", "shared", "both"], help="Where to publish/list parking items (default: personal; pass 'shared' or 'both' ONLY when explicitly requested)")
+    parser.add_argument("--title", type=str, help="Optional override title for --park-md / --park-item")
+    parser.add_argument("--icon", type=str, help="Optional emoji icon for parked child page (default: 🛡️)")
+    parser.add_argument("--clean-index", action="store_true", help="Strip non-child-page clutter from the Parking items index page")
     parser.add_argument("--date", type=str, default="today", help="Date in YYYY-MM-DD format or 'all' for --rebalance / --sync-shared")
     args = parser.parse_args()
 
@@ -1839,5 +2777,48 @@ if __name__ == "__main__":
     elif args.sync_shared:
         target = datetime.now().strftime("%Y-%m-%d") if args.date == "today" else args.date
         sync_shared(target_date=target)
+    elif args.init_parking:
+        init_parking_pages(
+            target=args.target,
+            personal_parent=args.parent_page,
+            shared_parent=args.shared_parent_page,
+            clean_index=args.clean_index,
+        )
+    elif args.park_item:
+        spec_path = Path(args.park_item)
+        if not spec_path.exists():
+            print(f"Error: Parking spec file not found: {args.park_item}")
+            sys.exit(1)
+        data = json.loads(spec_path.read_text(encoding="utf-8"))
+        if args.title:
+            data["title"] = args.title
+        if args.icon:
+            data["icon"] = args.icon
+        park_item(
+            data,
+            target=args.target,
+            personal_parent=args.parent_page,
+            shared_parent=args.shared_parent_page,
+            clean_index=args.clean_index,
+        )
+    elif args.park_md:
+        md_path = Path(args.park_md)
+        if not md_path.exists():
+            print(f"Error: Markdown plan file not found: {args.park_md}")
+            sys.exit(1)
+        data = {
+            "markdown_path": str(md_path),
+            "title": args.title or "",
+            "icon": args.icon or "🛡️",
+        }
+        park_item(
+            data,
+            target=args.target,
+            personal_parent=args.parent_page,
+            shared_parent=args.shared_parent_page,
+            clean_index=args.clean_index,
+        )
+    elif args.list_parking:
+        list_parking_items(target=args.target)
     else:
         parser.print_help()

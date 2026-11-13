@@ -1,7 +1,11 @@
 {
   "engineer_name": "Your Name",
+  "parent_page_id": "",
+  "parking_page_id": "",
   "tasks_database_id": "00000000-0000-0000-0000-000000000001",
   "eod_database_id": "00000000-0000-0000-0000-000000000002",
+  "shared_parent_page_id": "",
+  "shared_parking_page_id": "",
   "shared_tasks_database_id": "",
   "shared_eod_database_id": "",
   "default_project": "My Project",
